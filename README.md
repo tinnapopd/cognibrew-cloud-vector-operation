@@ -158,6 +158,7 @@ See [`.env.example`](.env.example) for all available configuration options.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
+| `LOG_LEVEL` | `INFO` | Logging level |
 | `ENVIRONMENT` | `production` | `local`, `staging`, or `production` |
 | `API_PREFIX_STR` | `/api/v1` | API route prefix |
 | `PROJECT_NAME` | `CogniBrew Vector Operation` | OpenAPI title |
@@ -166,4 +167,6 @@ See [`.env.example`](.env.example) for all available configuration options.
 | `QDRANT_COLLECTION` | `face_embeddings` | Qdrant collection name |
 | `EMBEDDING_DIM` | `512` | Embedding vector dimension |
 | `DRIFT_THRESHOLD` | `0.15` | Cosine distance threshold for drift detection |
-| `LOG_LEVEL` | `INFO` | Logging level |
+| `MLFLOW_TRACKING_URI` | `http://mlflow:5000` | MLflow tracking server URL |
+| `MLFLOW_EXPERIMENT_NAME` | `vector-evolution` | MLflow experiment name |
+| `OUTLIER_IQR_FACTOR` | `1.5` | IQR multiplier for outlier filtering |

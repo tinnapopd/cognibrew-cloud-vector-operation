@@ -22,8 +22,12 @@ class Settings(BaseSettings):
     # Drift detection threshold (cosine distance)
     DRIFT_THRESHOLD: float = 0.15
 
-    # Logging
-    LOG_LEVEL: str = "INFO"
+    # MLflow
+    MLFLOW_TRACKING_URI: str = "http://mlflow:5000"
+    MLFLOW_EXPERIMENT_NAME: str = "vector-evolution"
+
+    # Outlier filtering
+    OUTLIER_IQR_FACTOR: float = 1.5
 
 
 settings = Settings()  # type: ignore

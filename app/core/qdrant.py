@@ -1,3 +1,6 @@
+import uuid
+from datetime import datetime, timezone
+
 import numpy as np
 from qdrant_client import QdrantClient
 from qdrant_client.models import (
@@ -5,6 +8,7 @@ from qdrant_client.models import (
     FieldCondition,
     Filter,
     MatchValue,
+    PointStruct,
     VectorParams,
 )
 
@@ -34,10 +38,51 @@ def init_collection() -> None:
         )
 
 
+def ensure_collection() -> None:
+    """Alias that creates the collection if it does not exist."""
+    init_collection()
+
+
 def _user_filter(username: str) -> Filter:
     return Filter(
         must=[FieldCondition(key="username", match=MatchValue(value=username))]
     )
+
+
+def upsert_vectors(
+    vectors: list[tuple[str, list[float], str, bool, bool]],
+) -> int:
+    """Insert or update vectors in the gallery.
+
+    Args:
+        vectors: list of (username, embedding, anchor_type, is_correct, is_fallback)
+
+    Returns:
+        Number of points upserted.
+    """
+    points = []
+    now = datetime.now(timezone.utc).isoformat()
+    for username, embedding, anchor_type, is_correct, is_fallback in vectors:
+        points.append(
+            PointStruct(
+                id=str(uuid.uuid4()),
+                vector=embedding,
+                payload={
+                    "username": username,
+                    "anchor_type": anchor_type,
+                    "is_correct": is_correct,
+                    "is_fallback": is_fallback,
+                    "timestamp": now,
+                },
+            )
+        )
+    if points:
+        client().upsert(
+            collection_name=settings.QDRANT_COLLECTION,
+            points=points,
+        )
+
+    return len(points)
 
 
 def get_user_vectors(
