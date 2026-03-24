@@ -1,9 +1,11 @@
 import numpy as np
 from qdrant_client import QdrantClient
 from qdrant_client.models import (
+    Distance,
     FieldCondition,
     Filter,
     MatchValue,
+    VectorParams,
 )
 
 from app.core.config import settings
@@ -16,6 +18,20 @@ def client() -> QdrantClient:
         port=settings.QDRANT_PORT,
         prefer_grpc=True,
     )
+
+
+def init_collection() -> None:
+    """Create the face-embeddings collection if it doesn't exist."""
+    c = client()
+    existing = {col.name for col in c.get_collections().collections}
+    if settings.QDRANT_COLLECTION not in existing:
+        c.create_collection(
+            collection_name=settings.QDRANT_COLLECTION,
+            vectors_config=VectorParams(
+                size=settings.EMBEDDING_DIM,
+                distance=Distance.COSINE,
+            ),
+        )
 
 
 def _user_filter(username: str) -> Filter:
