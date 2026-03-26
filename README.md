@@ -6,11 +6,12 @@ On startup the service automatically creates the `face_embeddings` collection in
 
 ## API Endpoints
 
-| Method | Path | Description |
-|--------|------|-------------|
-| `POST` | `/api/v1/vectors/update/user-baseline` | Ingest embeddings and update user's baseline vectors |
-| `GET` | `/api/v1/vectors/threshold/{device_id}` | Get optimal similarity threshold for a device |
-| `GET` | `/api/v1/utils/health-check/` | Health check |
+| Method | Path                                    | Description                                          |
+| ------ | --------------------------------------- | ---------------------------------------------------- |
+| `POST` | `/api/v1/vectors/update/user-baseline`  | Ingest embeddings and update user's baseline vectors |
+| `GET`  | `/api/v1/vectors/threshold/{device_id}` | Get optimal similarity threshold for a device        |
+| `GET`  | `/api/v1/vectors/{device_id}`           | Get all baseline vectors for a device across users   |
+| `GET`  | `/api/v1/utils/health-check/`           | Health check                                         |
 
 ### Update User Baseline
 
@@ -57,6 +58,30 @@ curl "http://localhost:8000/api/v1/vectors/threshold/cam-01"
 
 > Falls back to `FALLBACK_SIMILARITY_THRESHOLD` when fewer than `MIN_CALIBRATION_SAMPLES` runs exist for the device.
 
+### Get Vectors by Device
+
+```bash
+curl "http://localhost:8000/api/v1/vectors/cam-01"
+```
+
+**Response:**
+
+```json
+{
+  "device_id": "cam-01",
+  "users": [
+    {
+      "username": "alice",
+      "vectors": [[0.1, 0.2, ...], [0.15, 0.25, ...]],
+      "vector_count": 2
+    }
+  ],
+  "total_users": 1
+}
+```
+
+> Returns all baseline vectors collected per device across all users.
+
 ## Project Structure
 
 ```
@@ -67,17 +92,19 @@ app/
 │   ├── deps.py             # Shared dependencies (placeholder)
 │   ├── main.py             # API router assembly
 │   └── routes/
-│       ├── vectors.py      # Gallery & drift endpoints
+│       ├── vectors.py      # Vector endpoints + MLflow calibration logic
 │       └── utils.py        # Health check
 ├── core/
-│   ├── config.py           # Settings (pydantic-settings)
-│   ├── engine.py           # Drift detection logic
+│   ├── config.py           # Settings (pydantic-settings) - 16 config parameters
 │   ├── logger.py           # JSON singleton logger
-│   ├── qdrant.py           # Qdrant client + collection init
-│   └── security.py         # Security notes (placeholder)
-├── models/                 # Pydantic schemas (placeholder)
-├── main.py                 # FastAPI application entry point
-├── pre_start.py            # Pre-startup script
+│   ├── qdrant.py           # Qdrant client initialization with CRUD operations
+│   └── security.py         # Security notes (placeholder - TLS at infrastructure level)
+├── models/
+│   ├── __init__.py
+│   └── schemas.py          # Pydantic request/response schemas
+├── __init__.py
+├── main.py                 # FastAPI application entry point with lifespan context
+├── pre_start.py            # Pre-startup hook (placeholder)
 └── utils.py                # Utility functions (placeholder)
 scripts/
 ├── init_qdrant.sh          # Local dev: spin up Qdrant container
@@ -110,6 +137,7 @@ docker run --name vector-operation \
   --add-host=host.docker.internal:host-gateway \
   -e ENVIRONMENT=local \
   -e QDRANT_HOST=host.docker.internal \
+  -e MLFLOW_TRACKING_URI=http://host.docker.internal:5000 \
   cognibrew-cloud-vector-operation
 ```
 
@@ -117,7 +145,7 @@ docker run --name vector-operation \
 
 ```bash
 pip install -r requirements.txt
-QDRANT_HOST=localhost uvicorn app.main:app --reload --port 8000
+QDRANT_HOST=localhost MLFLOW_TRACKING_URI=http://localhost:5000 uvicorn app.main:app --reload --port 8000
 ```
 
 ### Open API Docs
@@ -128,10 +156,10 @@ Visit [http://localhost:8000/docs](http://localhost:8000/docs) for interactive S
 
 GitHub Actions pipeline (`.github/workflows/ci.yml`):
 
-| Job | Trigger | Description |
-|-----|---------|-------------|
-| **Lint** | PR to `main`, push to `main`, tags | Runs [Ruff](https://docs.astral.sh/ruff/) linter |
-| **Build & Push** | Tags matching `v*` | Builds Docker image and pushes to Docker Hub |
+| Job              | Trigger                            | Description                                      |
+| ---------------- | ---------------------------------- | ------------------------------------------------ |
+| **Lint**         | PR to `main`, push to `main`, tags | Runs [Ruff](https://docs.astral.sh/ruff/) linter |
+| **Build & Push** | Tags matching `v*`                 | Builds Docker image and pushes to Docker Hub     |
 
 ### Image Tags
 
@@ -142,31 +170,30 @@ GitHub Actions pipeline (`.github/workflows/ci.yml`):
 
 ### Required Secrets
 
-| Secret | Description |
-|--------|-------------|
-| `DOCKERHUB_USERNAME` | Docker Hub username |
-| `DOCKERHUB_TOKEN` | Docker Hub access token |
+| Secret               | Description             |
+| -------------------- | ----------------------- |
+| `DOCKERHUB_USERNAME` | Docker Hub username     |
+| `DOCKERHUB_TOKEN`    | Docker Hub access token |
 
 ## Environment Variables
 
 See [`.env.example`](.env.example) for all available configuration options.
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR`, or `CRITICAL` |
-| `ENVIRONMENT` | `production` | `local`, `staging`, or `production` |
-| `API_PREFIX_STR` | `/api/v1` | API route prefix |
-| `PROJECT_NAME` | `CogniBrew Vector Operation` | OpenAPI title |
-| `QDRANT_HOST` | `localhost` | Qdrant service hostname |
-| `QDRANT_PORT` | `6334` | Qdrant gRPC port |
-| `QDRANT_COLLECTION` | `face_embeddings` | Qdrant collection name |
-| `EMBEDDING_DIM` | `512` | Embedding vector dimension |
-| `MLFLOW_TRACKING_URI` | `http://localhost:5000` | MLflow tracking server URL |
-| `MLFLOW_EXPERIMENT_NAME` | `vector-evolution` | MLflow experiment name |
-| `MAX_VECTORS_PER_USER` | `10` | Maximum baseline vectors stored per user |
-| `UPPER_SIMILARITY_THRESHOLD` | `0.92` | EMA update triggered above this similarity |
-| `LOWER_SIMILARITY_THRESHOLD` | `0.75` | New-look slot filled above this similarity |
-| `EMA_ALPHA` | `0.1` | EMA smoothing factor (0 = slow, 1 = fast) |
-| `MIN_CALIBRATION_SAMPLES` | `10` | Minimum MLflow runs before ROC calibration |
-| `FALLBACK_SIMILARITY_THRESHOLD` | `0.5` | Threshold used when calibration data is insufficient |
-
+| Variable                        | Default                      | Description                                          |
+| ------------------------------- | ---------------------------- | ---------------------------------------------------- |
+| `LOG_LEVEL`                     | `INFO`                       | `DEBUG`, `INFO`, `WARNING`, `ERROR`, or `CRITICAL`   |
+| `ENVIRONMENT`                   | `production`                 | `local`, `staging`, or `production`                  |
+| `API_PREFIX_STR`                | `/api/v1`                    | API route prefix                                     |
+| `PROJECT_NAME`                  | `CogniBrew Vector Operation` | OpenAPI title                                        |
+| `QDRANT_HOST`                   | `qdrant`                     | Qdrant service hostname                              |
+| `QDRANT_PORT`                   | `6334`                       | Qdrant gRPC port                                     |
+| `QDRANT_COLLECTION`             | `face_embeddings`            | Qdrant collection name                               |
+| `EMBEDDING_DIM`                 | `512`                        | Embedding vector dimension                           |
+| `MLFLOW_TRACKING_URI`           | `http://mlflow:5000`         | MLflow tracking server URL                           |
+| `MLFLOW_EXPERIMENT_NAME`        | `vector-evolution`           | MLflow experiment name                               |
+| `MAX_VECTORS_PER_USER`          | `10`                         | Maximum baseline vectors stored per user             |
+| `UPPER_SIMILARITY_THRESHOLD`    | `0.92`                       | EMA update triggered above this similarity           |
+| `LOWER_SIMILARITY_THRESHOLD`    | `0.75`                       | New-look slot filled above this similarity           |
+| `EMA_ALPHA`                     | `0.1`                        | EMA smoothing factor (0 = slow, 1 = fast)            |
+| `MIN_CALIBRATION_SAMPLES`       | `10`                         | Minimum MLflow runs before ROC calibration           |
+| `FALLBACK_SIMILARITY_THRESHOLD` | `0.65`                       | Threshold used when calibration data is insufficient |

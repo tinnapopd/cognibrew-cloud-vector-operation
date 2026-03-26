@@ -10,11 +10,14 @@ from app.core.qdrant import (
     get_user_baselines,
     update_vector,
     upsert_vector,
+    get_vectors_by_usernames,
 )
 from app.models.schemas import (
     UpdateUserBaselineRequest,
     UpdateUserBaselineResponse,
     ThresholdResponse,
+    DeviceVectorEntry,
+    GetVectorsByDeviceIdResponse,
 )
 
 router = APIRouter(prefix="/vectors", tags=["vectors"])
@@ -34,7 +37,7 @@ async def update_user_baseline(
     if not filter_vector:
         return UpdateUserBaselineResponse(
             status="skipped",
-            action="",
+            action="skipped",
             username=body.username,
             max_similarity=0.0,
         )
@@ -132,7 +135,6 @@ async def get_device_threshold(device_id: str) -> ThresholdResponse:
             device_id=device_id,
             optimal_threshold=settings.FALLBACK_SIMILARITY_THRESHOLD,
             sample_count=0,
-            method="fallback_global",
         )
 
     runs = mlflow.search_runs(
@@ -164,8 +166,8 @@ async def get_device_threshold(device_id: str) -> ThresholdResponse:
             sample_count=sample_count,
         )
 
-    y_scores: list[float] = runs["metrics.max_similarity"].tolist()
-    y_true: list[int] = [
+    y_scores = runs["metrics.max_similarity"].tolist()
+    y_true = [
         1 if action in POSITIVE_ACTIONS else 0
         for action in runs["params.action"].tolist()
     ]
@@ -187,4 +189,54 @@ async def get_device_threshold(device_id: str) -> ThresholdResponse:
         device_id=device_id,
         optimal_threshold=optimal_threshold,
         sample_count=sample_count,
+    )
+
+
+@router.get("/{device_id}", response_model=GetVectorsByDeviceIdResponse)
+async def get_vectors_by_device_id(
+    device_id: str,
+) -> GetVectorsByDeviceIdResponse:
+    """Return all vector records stored in Qdrant for every user
+    associated with *device_id*.
+
+    Looks up MLflow runs to discover which usernames have been logged
+    against the device, then fetches their baseline vectors from Qdrant.
+    """
+    experiment = mlflow.get_experiment_by_name(settings.MLFLOW_EXPERIMENT_NAME)
+    if experiment is None:
+        return GetVectorsByDeviceIdResponse(
+            device_id=device_id,
+            users=[],
+            total_users=0,
+        )
+
+    runs = mlflow.search_runs(
+        experiment_ids=[experiment.experiment_id],
+        filter_string=f"params.device_id = '{device_id}'",
+        output_format="pandas",
+    )
+
+    if not isinstance(runs, pd.DataFrame):
+        runs = pd.DataFrame(runs)
+
+    if runs.empty or "params.username" not in runs.columns:
+        return GetVectorsByDeviceIdResponse(
+            device_id=device_id, users=[], total_users=0
+        )
+
+    usernames = runs["params.username"].dropna().unique().tolist()
+    users_data = get_vectors_by_usernames(usernames)
+    entries = [
+        DeviceVectorEntry(
+            username=username,
+            vectors=vectors,
+            vector_count=len(vectors),
+        )
+        for username, vectors in users_data.items()
+    ]
+
+    return GetVectorsByDeviceIdResponse(
+        device_id=device_id,
+        users=entries,
+        total_users=len(entries),
     )

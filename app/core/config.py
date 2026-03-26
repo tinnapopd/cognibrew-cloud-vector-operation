@@ -39,7 +39,7 @@ class Settings(BaseSettings):
     # If fewer runs exist for a device_id, the fallback threshold is returned.
     MIN_CALIBRATION_SAMPLES: int = 10
     # Returned when there is insufficient data to calibrate a device.
-    FALLBACK_SIMILARITY_THRESHOLD: float = 0.5
+    FALLBACK_SIMILARITY_THRESHOLD: float = 0.65
 
 
 settings = Settings()  # type: ignore

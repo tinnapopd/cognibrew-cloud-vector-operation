@@ -115,3 +115,37 @@ def upsert_vector(
             )
         ],
     )
+
+
+def get_vectors_by_usernames(
+    usernames: list[str],
+) -> dict[str, list[list[float]]]:
+
+    client = qdrant_client()
+    result = {}
+    for username in usernames:
+        points = client.scroll(
+            collection_name=settings.QDRANT_COLLECTION,
+            scroll_filter=Filter(
+                must=[
+                    FieldCondition(
+                        key="username", match=MatchValue(value=username)
+                    )
+                ]
+            ),
+            with_vectors=True,
+            limit=settings.MAX_VECTORS_PER_USER,
+        )[0]
+
+        vectors = []
+        for pt in points:
+            raw = pt.vector
+            if isinstance(raw, list) and raw:
+                vectors.append(
+                    [float(v) for v in raw if isinstance(v, (int, float))]
+                )
+
+        if vectors:
+            result[username] = vectors
+
+    return result
