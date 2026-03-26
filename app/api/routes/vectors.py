@@ -1,311 +1,190 @@
-import asyncio
-from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor
-from typing import Optional
-
+import pandas as pd
+from fastapi import APIRouter
 import mlflow
 import numpy as np
-from fastapi import APIRouter, Query
-from pydantic import BaseModel
+from sklearn.metrics import roc_curve
+from sklearn.metrics.pairwise import cosine_similarity
 
 from app.core.config import settings
-from app.core.engine import detect_drift
 from app.core.qdrant import (
-    ensure_collection,
-    get_all_usernames,
-    get_user_baseline,
-    get_user_vectors,
-    upsert_vectors,
+    get_user_baselines,
+    update_vector,
+    upsert_vector,
+)
+from app.models.schemas import (
+    UpdateUserBaselineRequest,
+    UpdateUserBaselineResponse,
+    ThresholdResponse,
 )
 
 router = APIRouter(prefix="/vectors", tags=["vectors"])
 
-# Single shared thread-pool — Qdrant client is synchronous
-_executor = ThreadPoolExecutor(max_workers=8)
-
 mlflow.set_tracking_uri(settings.MLFLOW_TRACKING_URI)
 mlflow.set_experiment(settings.MLFLOW_EXPERIMENT_NAME)
 
-_IQR_FACTOR = settings.OUTLIER_IQR_FACTOR
 
-
-def _run_sync(fn, *args, **kwargs):
-    """Offload a synchronous function to the executor."""
-    loop = asyncio.get_event_loop()
-    return loop.run_in_executor(_executor, lambda: fn(*args, **kwargs))
-
-
-class VectorRecord(BaseModel):
-    username: str
-    embedding: list[float]
-    is_correct: bool = True
-    is_fallback: bool = False
-
-
-class ProcessBatchRequest(BaseModel):
-    vectors: list[VectorRecord] = []
-
-
-class ExpandGalleryRequest(BaseModel):
-    vectors: list[VectorRecord] = []
-
-
-def _filter_outliers_iqr(distances: np.ndarray) -> np.ndarray:
-    """Return a boolean mask; True = keep."""
-    if len(distances) < 4:
-        return np.ones(len(distances), dtype=bool)
-    q1 = float(np.percentile(distances, 25))
-    q3 = float(np.percentile(distances, 75))
-    iqr = q3 - q1
-    lower = q1 - _IQR_FACTOR * iqr
-    upper = q3 + _IQR_FACTOR * iqr
-    return (distances >= lower) & (distances <= upper)
-
-
-def _cosine_distances(
-    vectors: np.ndarray, reference: np.ndarray
-) -> np.ndarray:
-    ref_norm = reference / (np.linalg.norm(reference) + 1e-12)
-    norms = np.linalg.norm(vectors, axis=1, keepdims=True) + 1e-12
-    return 1.0 - (vectors / norms) @ ref_norm
-
-
-@router.post("/process-batch")
-async def process_batch(body: ProcessBatchRequest) -> dict:
-    """Analyse incoming embeddings: drift detection +
-    outlier filtering + gallery upsert.
-
-    Called by the Airflow ``process_vectors`` task:
-        POST /vectors/process-batch
-    """
-    await _run_sync(ensure_collection)
-
-    by_user: dict[str, list[VectorRecord]] = defaultdict(list)
-    for v in body.vectors:
-        by_user[v.username].append(v)
-
-    total_accepted = 0
-    total_rejected = 0
-    drift_users: list[str] = []
-
-    for username, records in by_user.items():
-        embeddings = np.array([r.embedding for r in records], dtype=np.float32)
-        baseline = await _run_sync(get_user_baseline, username)
-        existing = await _run_sync(
-            get_user_vectors, username, with_vectors=False
+@router.post(
+    "/update/user-baseline",
+    response_model=UpdateUserBaselineResponse,
+)
+async def update_user_baseline(
+    body: UpdateUserBaselineRequest,
+) -> UpdateUserBaselineResponse:
+    filter_vector = [v for v in body.vectors if v.is_correct]
+    if not filter_vector:
+        return UpdateUserBaselineResponse(
+            status="skipped",
+            action="",
+            username=body.username,
+            max_similarity=0.0,
         )
-        gallery_size = len(existing)
 
-        if baseline is None:
-            # First-ever vectors — first one becomes baseline
-            to_upsert = [
-                (
-                    username,
-                    emb.tolist(),
-                    "baseline" if i == 0 else "temporal",
-                    records[i].is_correct,
-                    records[i].is_fallback,
-                )
-                for i, emb in enumerate(embeddings)
-            ]
-            await _run_sync(upsert_vectors, to_upsert)
-            total_accepted += len(to_upsert)
-            mean_drift, max_drift, is_drifting = 0.0, 0.0, False
-        else:
-            distances = _cosine_distances(embeddings, baseline)
-            mask = _filter_outliers_iqr(distances)
-            kept = embeddings[mask]
+    # Compute average vector from correct vectors
+    avg_vector = np.mean([v.embedding for v in filter_vector], axis=0).astype(
+        np.float32
+    )
+    # Get user's baselines - list[np.ndarray]
+    baselines = get_user_baselines(body.username)
 
-            to_upsert = [
-                (
-                    username,
-                    emb.tolist(),
-                    "temporal",
-                    records[i].is_correct,
-                    records[i].is_fallback,
-                )
-                for i, emb in enumerate(kept)
-            ]
-            if to_upsert:
-                await _run_sync(upsert_vectors, to_upsert)
+    if not baselines:
+        upsert_vector(
+            username=body.username,
+            embedding=avg_vector.tolist(),
+            is_correct=True,
+        )
+        return UpdateUserBaselineResponse(
+            status="ok",
+            action="bootstrap",
+            username=body.username,
+            max_similarity=0.0,
+        )
 
-            accepted = int(mask.sum())
-            rejected = int((~mask).sum())
-            total_accepted += accepted
-            total_rejected += rejected
+    # Compute cosine similarity against every baseline
+    avg_2d = avg_vector.reshape(1, -1)
+    similarities = [
+        float(cosine_similarity(avg_2d, b.reshape(1, -1))[0][0])
+        for b in baselines
+    ]
+    max_similarity = max(similarities)
+    best_idx = int(np.argmax(similarities))
 
-            drift_result = detect_drift(
-                username=username,
-                gallery_vectors=kept if len(kept) > 0 else embeddings,
-                baseline=baseline,
-                gallery_size=gallery_size + accepted,
+    # Branch 1: High similarity: Update via EMA. It's the same angle/lighting,
+    # just a slightly different day.
+    if max_similarity > settings.UPPER_SIMILARITY_THRESHOLD:
+        alpha = settings.EMA_ALPHA
+        updated = (1 - alpha) * baselines[best_idx] + alpha * avg_vector
+        update_vector(body.username, best_idx, updated.tolist())
+        action = "ema_update"
+
+    # Branch 2: New look, fill empty slot. This is likely a side profile or
+    # different lighting.
+    elif max_similarity > settings.LOWER_SIMILARITY_THRESHOLD:
+        if len(baselines) < settings.MAX_VECTORS_PER_USER:
+            upsert_vector(
+                username=body.username,
+                embedding=avg_vector.tolist(),
+                is_correct=True,
             )
-            mean_drift = drift_result.mean_drift
-            max_drift = drift_result.max_drift
-            is_drifting = drift_result.is_drifting
+        action = "new_look"
 
-            if is_drifting:
-                drift_users.append(username)
+    # Branch 3: Discard. Even if confirmed by the barista, the image might be
+    # too blurry/dark to be a useful template.
+    else:
+        action = "discard"
 
-            # MLflow per-user drift
-            try:
-                with mlflow.start_run(
-                    run_name=f"drift-{username}", nested=True
-                ):
-                    mlflow.log_param("username", username)
-                    mlflow.log_metric("mean_drift", mean_drift)
-                    mlflow.log_metric("max_drift", max_drift)
-                    mlflow.log_metric("is_drifting", int(is_drifting))
-                    mlflow.log_metric(
-                        "gallery_size", drift_result.gallery_size
-                    )
-            except Exception:
-                pass
-
-    # MLflow outlier summary
     try:
-        with mlflow.start_run(run_name="outlier-filter", nested=True):
-            total_input = total_accepted + total_rejected
-            mlflow.log_metric("total_input", total_input)
-            mlflow.log_metric("accepted", total_accepted)
-            mlflow.log_metric("rejected", total_rejected)
-            if total_input > 0:
-                mlflow.log_metric(
-                    "rejection_rate", total_rejected / total_input
-                )
+        with mlflow.start_run(run_name=f"process-{body.username}"):
+            mlflow.log_param("username", body.username)
+            mlflow.log_param("device_id", body.device_id)
+            mlflow.log_param("action", action)
+            mlflow.log_metric("max_similarity", round(max_similarity, 4))
+            mlflow.log_metric("baseline_vectors", len(baselines))
+            mlflow.log_metric("input_vectors", len(filter_vector))
     except Exception:
         pass
 
-    return {
-        "accepted": total_accepted,
-        "rejected": total_rejected,
-        "drift_users": drift_users,
-    }
+    return UpdateUserBaselineResponse(
+        status="ok",
+        action=action,
+        username=body.username,
+        max_similarity=round(max_similarity, 4),
+    )
 
 
-@router.post("/expand-gallery")
-async def expand_gallery(body: ExpandGalleryRequest) -> dict:
-    """Add fallback-verified vectors as secondary anchors.
+@router.get("/threshold/{device_id}", response_model=ThresholdResponse)
+async def get_device_threshold(device_id: str) -> ThresholdResponse:
+    """Return the optimal cosine-similarity threshold for a given device_id.
 
-    Called by the Airflow ``gallery_expansion`` task:
-        POST /vectors/expand-gallery
+    Queries all MLflow runs tagged with the device_id, extracts
+    (max_similarity, label) pairs, and computes the threshold that maximises
+    Youden's J (sensitivity + specificity - 1) on the ROC curve.
+
+    Falls back to FALLBACK_SIMILARITY_THRESHOLD (0.5) when there are fewer
+    than MIN_CALIBRATION_SAMPLES runs available for the device.
     """
-    if not body.vectors:
-        return {"upserted": 0}
+    # Positive actions = person was successfully matched / enrolled.
+    # "discard" = similarity too low, treated as a negative / no-match.
+    POSITIVE_ACTIONS = {"ema_update", "new_look", "bootstrap"}
 
-    to_upsert = [
-        (
-            v.username,
-            v.embedding,
-            "secondary",
-            v.is_correct,
-            v.is_fallback,
+    experiment = mlflow.get_experiment_by_name(settings.MLFLOW_EXPERIMENT_NAME)
+    if experiment is None:
+        return ThresholdResponse(
+            device_id=device_id,
+            optimal_threshold=settings.FALLBACK_SIMILARITY_THRESHOLD,
+            sample_count=0,
+            method="fallback_global",
         )
-        for v in body.vectors
+
+    runs = mlflow.search_runs(
+        experiment_ids=[experiment.experiment_id],
+        filter_string=f"params.device_id = '{device_id}'",
+        output_format="pandas",
+    )
+
+    if not isinstance(runs, pd.DataFrame):
+        runs = pd.DataFrame(runs)
+
+    # Keep rows that have the data we need
+    required_cols = {"params.action", "metrics.max_similarity"}
+    available_cols = set(runs.columns)
+    if required_cols - available_cols or runs.empty:
+        return ThresholdResponse(
+            device_id=device_id,
+            optimal_threshold=settings.FALLBACK_SIMILARITY_THRESHOLD,
+            sample_count=0,
+        )
+
+    runs = runs.dropna(subset=["params.action", "metrics.max_similarity"])
+    sample_count = len(runs)
+
+    if sample_count < settings.MIN_CALIBRATION_SAMPLES:
+        return ThresholdResponse(
+            device_id=device_id,
+            optimal_threshold=settings.FALLBACK_SIMILARITY_THRESHOLD,
+            sample_count=sample_count,
+        )
+
+    y_scores: list[float] = runs["metrics.max_similarity"].tolist()
+    y_true: list[int] = [
+        1 if action in POSITIVE_ACTIONS else 0
+        for action in runs["params.action"].tolist()
     ]
-    count = await _run_sync(upsert_vectors, to_upsert)
 
-    # MLflow per-user gallery expansion
-    by_user: dict[str, int] = defaultdict(int)
-    for v in body.vectors:
-        by_user[v.username] += 1
-
-    for username, added in by_user.items():
-        existing = await _run_sync(
-            get_user_vectors, username, with_vectors=False
+    # Need both classes present for ROC analysis
+    if len(set(y_true)) < 2:
+        return ThresholdResponse(
+            device_id=device_id,
+            optimal_threshold=settings.FALLBACK_SIMILARITY_THRESHOLD,
+            sample_count=sample_count,
         )
-        try:
-            with mlflow.start_run(
-                run_name=f"gallery-expand-{username}", nested=True
-            ):
-                mlflow.log_param("username", username)
-                mlflow.log_metric("vectors_added", added)
-                mlflow.log_metric("new_gallery_size", len(existing))
-        except Exception:
-            pass
 
-    return {"upserted": count, "users": list(by_user.keys())}
+    fpr, tpr, thresholds = roc_curve(y_true, y_scores)
+    youden_j = tpr - fpr
+    best_idx = int(np.argmax(youden_j))
+    optimal_threshold = round(float(thresholds[best_idx]), 4)
 
-
-@router.get("/{username}/gallery")
-async def get_gallery(
-    username: str,
-    include_embeddings: bool = Query(
-        False, description="Include 512-dim embedding arrays in response"
-    ),
-) -> dict:
-    """Return the vector gallery for a specific user.
-
-    This is consumed by ``cognibrew-cloud-edge-sync`` to build the sync bundle:
-        GET /vectors/{username}/gallery?include_embeddings=true
-    """
-    raw = await _run_sync(
-        get_user_vectors, username, with_vectors=include_embeddings
+    return ThresholdResponse(
+        device_id=device_id,
+        optimal_threshold=optimal_threshold,
+        sample_count=sample_count,
     )
-
-    baseline_count = sum(1 for v in raw if v["anchor_type"] == "baseline")
-    secondary_count = sum(1 for v in raw if v["anchor_type"] == "secondary")
-    temporal_count = sum(1 for v in raw if v["anchor_type"] == "temporal")
-
-    return {
-        "username": username,
-        "total_vectors": len(raw),
-        "baseline_count": baseline_count,
-        "secondary_count": secondary_count,
-        "temporal_count": temporal_count,
-        "vectors": raw,
-    }
-
-
-@router.get("/drift-signals")
-async def get_drift_signals(
-    username: Optional[str] = Query(
-        None, description="Compute drift for a single user only"
-    ),
-) -> dict:
-    """Return drift telemetry for all users (or one user).
-
-    Consumed by ``cognibrew-cloud-edge-sync`` to build the user list before
-    paginating galleries:
-        GET /vectors/drift-signals
-    """
-    usernames = [username] if username else await _run_sync(get_all_usernames)
-
-    if not usernames:
-        return {"signals": [], "global_mean_drift": 0.0}
-
-    async def _drift_for_user(u: str) -> dict | None:
-        baseline = await _run_sync(get_user_baseline, u)
-        if baseline is None:
-            return None
-        vecs_raw = await _run_sync(get_user_vectors, u, with_vectors=True)
-        if not vecs_raw:
-            return None
-        embeddings = np.array(
-            [v["embedding"] for v in vecs_raw if v.get("embedding")],
-            dtype=np.float32,
-        )
-        if len(embeddings) == 0:
-            return None
-        result = detect_drift(
-            username=u,
-            gallery_vectors=embeddings,
-            baseline=baseline,
-            gallery_size=len(vecs_raw),
-        )
-        return {
-            "username": result.username,
-            "mean_drift": result.mean_drift,
-            "max_drift": result.max_drift,
-            "gallery_size": result.gallery_size,
-            "is_drifting": result.is_drifting,
-        }
-
-    results = await asyncio.gather(*[_drift_for_user(u) for u in usernames])
-    signals = [r for r in results if r is not None]
-
-    global_mean = (
-        float(np.mean([s["mean_drift"] for s in signals])) if signals else 0.0
-    )
-
-    return {"signals": signals, "global_mean_drift": global_mean}
