@@ -1,6 +1,6 @@
 # CogniBrew Cloud Vector Operation
 
-Read-only API exposing the Qdrant face-embedding gallery and drift telemetry produced by the Airflow vector-operation DAG. Consumed by `cognibrew-cloud-edge-sync`.
+API service for managing face-embedding baselines in Qdrant and calibrating per-device similarity thresholds via MLflow. Consumed by `cognibrew-cloud-edge-sync`.
 
 On startup the service automatically creates the `face_embeddings` collection in Qdrant if it does not already exist.
 
@@ -8,59 +8,54 @@ On startup the service automatically creates the `face_embeddings` collection in
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `GET` | `/api/v1/vectors/{username}/gallery` | Face-embedding gallery for a user |
-| `GET` | `/api/v1/vectors/drift-signals` | Drift telemetry for all (or one) user |
+| `POST` | `/api/v1/vectors/update/user-baseline` | Ingest embeddings and update user's baseline vectors |
+| `GET` | `/api/v1/vectors/threshold/{device_id}` | Get optimal similarity threshold for a device |
 | `GET` | `/api/v1/utils/health-check/` | Health check |
 
-### Get Gallery
+### Update User Baseline
 
 ```bash
-# Without embeddings (metadata only)
-curl "http://localhost:8000/api/v1/vectors/alice/gallery"
-
-# With 512-dim embedding arrays
-curl "http://localhost:8000/api/v1/vectors/alice/gallery?include_embeddings=true"
+curl -X POST "http://localhost:8000/api/v1/vectors/update/user-baseline" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "username": "alice",
+    "device_id": "cam-01",
+    "vectors": [
+      {"embedding": [0.1, 0.2, ...], "is_correct": true}
+    ]
+  }'
 ```
 
 **Response:**
 
 ```json
 {
+  "status": "ok",
+  "action": "ema_update",
   "username": "alice",
-  "total_vectors": 12,
-  "baseline_count": 1,
-  "secondary_count": 6,
-  "temporal_count": 5,
-  "vectors": [...]
+  "max_similarity": 0.9512
 }
 ```
 
-### Get Drift Signals
+> `action` is one of: `bootstrap`, `ema_update`, `new_look`, `discard`, or `skipped`.
+
+### Get Device Threshold
 
 ```bash
-# All users
-curl "http://localhost:8000/api/v1/vectors/drift-signals"
-
-# Single user
-curl "http://localhost:8000/api/v1/vectors/drift-signals?username=alice"
+curl "http://localhost:8000/api/v1/vectors/threshold/cam-01"
 ```
 
 **Response:**
 
 ```json
 {
-  "signals": [
-    {
-      "username": "alice",
-      "mean_drift": 0.08,
-      "max_drift": 0.14,
-      "gallery_size": 12,
-      "is_drifting": false
-    }
-  ],
-  "global_mean_drift": 0.08
+  "device_id": "cam-01",
+  "optimal_threshold": 0.8734,
+  "sample_count": 42
 }
 ```
+
+> Falls back to `FALLBACK_SIMILARITY_THRESHOLD` when fewer than `MIN_CALIBRATION_SAMPLES` runs exist for the device.
 
 ## Project Structure
 
@@ -158,15 +153,20 @@ See [`.env.example`](.env.example) for all available configuration options.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `LOG_LEVEL` | `INFO` | Logging level |
+| `LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR`, or `CRITICAL` |
 | `ENVIRONMENT` | `production` | `local`, `staging`, or `production` |
 | `API_PREFIX_STR` | `/api/v1` | API route prefix |
 | `PROJECT_NAME` | `CogniBrew Vector Operation` | OpenAPI title |
-| `QDRANT_HOST` | `qdrant` | Qdrant service hostname |
+| `QDRANT_HOST` | `localhost` | Qdrant service hostname |
 | `QDRANT_PORT` | `6334` | Qdrant gRPC port |
 | `QDRANT_COLLECTION` | `face_embeddings` | Qdrant collection name |
 | `EMBEDDING_DIM` | `512` | Embedding vector dimension |
-| `DRIFT_THRESHOLD` | `0.15` | Cosine distance threshold for drift detection |
-| `MLFLOW_TRACKING_URI` | `http://mlflow:5000` | MLflow tracking server URL |
+| `MLFLOW_TRACKING_URI` | `http://localhost:5000` | MLflow tracking server URL |
 | `MLFLOW_EXPERIMENT_NAME` | `vector-evolution` | MLflow experiment name |
-| `OUTLIER_IQR_FACTOR` | `1.5` | IQR multiplier for outlier filtering |
+| `MAX_VECTORS_PER_USER` | `10` | Maximum baseline vectors stored per user |
+| `UPPER_SIMILARITY_THRESHOLD` | `0.92` | EMA update triggered above this similarity |
+| `LOWER_SIMILARITY_THRESHOLD` | `0.75` | New-look slot filled above this similarity |
+| `EMA_ALPHA` | `0.1` | EMA smoothing factor (0 = slow, 1 = fast) |
+| `MIN_CALIBRATION_SAMPLES` | `10` | Minimum MLflow runs before ROC calibration |
+| `FALLBACK_SIMILARITY_THRESHOLD` | `0.5` | Threshold used when calibration data is insufficient |
+
