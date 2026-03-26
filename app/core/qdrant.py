@@ -9,13 +9,14 @@ from qdrant_client.models import (
     Filter,
     MatchValue,
     PointStruct,
+    PointVectors,
     VectorParams,
 )
 
 from app.core.config import settings
 
 
-def client() -> QdrantClient:
+def qdrant_client() -> QdrantClient:
     """Return a Qdrant gRPC client."""
     return QdrantClient(
         host=settings.QDRANT_HOST,
@@ -25,11 +26,10 @@ def client() -> QdrantClient:
 
 
 def init_collection() -> None:
-    """Create the face-embeddings collection if it doesn't exist."""
-    c = client()
-    existing = {col.name for col in c.get_collections().collections}
+    client = qdrant_client()
+    existing = {col.name for col in client.get_collections().collections}
     if settings.QDRANT_COLLECTION not in existing:
-        c.create_collection(
+        client.create_collection(
             collection_name=settings.QDRANT_COLLECTION,
             vectors_config=VectorParams(
                 size=settings.EMBEDDING_DIM,
@@ -38,115 +38,80 @@ def init_collection() -> None:
         )
 
 
-def ensure_collection() -> None:
-    """Alias that creates the collection if it does not exist."""
-    init_collection()
+def get_user_baselines(username: str) -> list[np.ndarray]:
+    """Return the baseline vectors for a user, or empty list if not found."""
+    client = qdrant_client()
+    results = client.scroll(
+        collection_name=settings.QDRANT_COLLECTION,
+        scroll_filter=Filter(
+            must=[
+                FieldCondition(
+                    key="username", match=MatchValue(value=username)
+                )
+            ]
+        ),
+        with_vectors=True,
+        limit=settings.MAX_VECTORS_PER_USER,
+    )[0]
+
+    baselines: list[np.ndarray] = []
+    for pt in results:
+        raw = pt.vector
+        if not isinstance(raw, list):
+            continue
+
+        baselines.append(np.array(raw, dtype=np.float32))
+
+    return baselines
 
 
-def _user_filter(username: str) -> Filter:
-    return Filter(
-        must=[FieldCondition(key="username", match=MatchValue(value=username))]
+def update_vector(
+    username: str,
+    baseline_index: int,
+    new_vector: list[float],
+) -> None:
+    client = qdrant_client()
+    results = client.scroll(
+        collection_name=settings.QDRANT_COLLECTION,
+        scroll_filter=Filter(
+            must=[
+                FieldCondition(
+                    key="username", match=MatchValue(value=username)
+                )
+            ]
+        ),
+        with_vectors=False,
+        limit=settings.MAX_VECTORS_PER_USER,
+    )[0]
+
+    if baseline_index >= len(results):
+        return None
+
+    point_id = results[baseline_index].id
+    client.update_vectors(
+        collection_name=settings.QDRANT_COLLECTION,
+        points=[PointVectors(id=point_id, vector=new_vector)],
     )
 
 
-def upsert_vectors(
-    vectors: list[tuple[str, list[float], str, bool, bool]],
-) -> int:
-    """Insert or update vectors in the gallery.
-
-    Args:
-        vectors: list of (username, embedding, anchor_type, is_correct, is_fallback)
-
-    Returns:
-        Number of points upserted.
-    """
-    points = []
+def upsert_vector(
+    username: str,
+    embedding: list[float],
+    is_correct: bool,
+) -> None:
+    client = qdrant_client()
     now = datetime.now(timezone.utc).isoformat()
-    for username, embedding, anchor_type, is_correct, is_fallback in vectors:
-        points.append(
+    client.upsert(
+        collection_name=settings.QDRANT_COLLECTION,
+        points=[
             PointStruct(
                 id=str(uuid.uuid4()),
                 vector=embedding,
                 payload={
                     "username": username,
-                    "anchor_type": anchor_type,
                     "is_correct": is_correct,
-                    "is_fallback": is_fallback,
                     "timestamp": now,
                 },
             )
-        )
-    if points:
-        client().upsert(
-            collection_name=settings.QDRANT_COLLECTION,
-            points=points,
-        )
-
-    return len(points)
-
-
-def get_user_vectors(
-    username: str, *, with_vectors: bool = True, limit: int = 1000
-) -> list[dict]:
-    """Retrieve all gallery vectors for a user.
-
-    Returns list of dicts: {point_id, username, anchor_type, timestamp, embedding?}.
-    """
-    results = client().scroll(
-        collection_name=settings.QDRANT_COLLECTION,
-        scroll_filter=_user_filter(username),
-        with_vectors=with_vectors,
-        limit=limit,
-    )[0]
-
-    out = []
-    for pt in results:
-        if pt.payload is None:
-            continue
-        rec: dict = {
-            "point_id": str(pt.id),
-            "username": pt.payload["username"],
-            "anchor_type": pt.payload["anchor_type"],
-            "timestamp": pt.payload.get("timestamp", ""),
-        }
-        if with_vectors and isinstance(pt.vector, list):
-            rec["embedding"] = pt.vector
-        out.append(rec)
-
-    return out
-
-
-def get_user_baseline(username: str) -> np.ndarray | None:
-    """Return the baseline vector for a user, or None if not found."""
-    filt = Filter(
-        must=[
-            FieldCondition(key="username", match=MatchValue(value=username)),
-            FieldCondition(
-                key="anchor_type", match=MatchValue(value="baseline")
-            ),
-        ]
-    )
-    results = client().scroll(
-        collection_name=settings.QDRANT_COLLECTION,
-        scroll_filter=filt,
-        with_vectors=True,
-        limit=1,
-    )[0]
-    if not results:
-        return None
-    vec = results[0].vector
-    if not isinstance(vec, list):
-        return None
-    return np.array(vec, dtype=np.float32)
-
-
-def get_all_usernames() -> list[str]:
-    """Return distinct usernames in the gallery."""
-    results = client().scroll(
-        collection_name=settings.QDRANT_COLLECTION,
-        with_vectors=False,
-        limit=10_000,
-    )[0]
-    return list(
-        {pt.payload["username"] for pt in results if pt.payload is not None}
+        ],
     )
