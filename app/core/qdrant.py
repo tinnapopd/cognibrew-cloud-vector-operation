@@ -16,17 +16,7 @@ from qdrant_client.models import (
 from app.core.config import settings
 
 
-def qdrant_client() -> QdrantClient:
-    """Return a Qdrant gRPC client."""
-    return QdrantClient(
-        host=settings.QDRANT_HOST,
-        port=settings.QDRANT_PORT,
-        prefer_grpc=True,
-    )
-
-
-def init_collection() -> None:
-    client = qdrant_client()
+def init_collection(client: QdrantClient) -> None:
     existing = {col.name for col in client.get_collections().collections}
     if settings.QDRANT_COLLECTION not in existing:
         client.create_collection(
@@ -38,9 +28,8 @@ def init_collection() -> None:
         )
 
 
-def get_user_baselines(username: str) -> list[np.ndarray]:
+def get_user_baselines(client: QdrantClient, username: str) -> list[np.ndarray]:
     """Return the baseline vectors for a user, or empty list if not found."""
-    client = qdrant_client()
     results = client.scroll(
         collection_name=settings.QDRANT_COLLECTION,
         scroll_filter=Filter(
@@ -66,11 +55,11 @@ def get_user_baselines(username: str) -> list[np.ndarray]:
 
 
 def update_vector(
+    client: QdrantClient,
     username: str,
     baseline_index: int,
     new_vector: list[float],
 ) -> None:
-    client = qdrant_client()
     results = client.scroll(
         collection_name=settings.QDRANT_COLLECTION,
         scroll_filter=Filter(
@@ -95,11 +84,11 @@ def update_vector(
 
 
 def upsert_vector(
+    client: QdrantClient,
     username: str,
     embedding: list[float],
     is_correct: bool,
 ) -> None:
-    client = qdrant_client()
     now = datetime.now(timezone.utc).isoformat()
     client.upsert(
         collection_name=settings.QDRANT_COLLECTION,
@@ -118,10 +107,10 @@ def upsert_vector(
 
 
 def get_vectors_by_usernames(
+    client: QdrantClient,
     usernames: list[str],
 ) -> dict[str, list[list[float]]]:
 
-    client = qdrant_client()
     result = {}
     for username in usernames:
         points = client.scroll(

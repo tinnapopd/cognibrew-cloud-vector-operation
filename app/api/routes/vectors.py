@@ -5,6 +5,7 @@ import numpy as np
 from sklearn.metrics import roc_curve
 from sklearn.metrics.pairwise import cosine_similarity
 
+from app.api.deps import QdrantDep
 from app.core.config import settings
 from app.core.qdrant import (
     get_user_baselines,
@@ -32,6 +33,7 @@ mlflow.set_experiment(settings.MLFLOW_EXPERIMENT_NAME)
 )
 async def update_user_baseline(
     body: UpdateUserBaselineRequest,
+    qdrant: QdrantDep,
 ) -> UpdateUserBaselineResponse:
     filter_vector = [v for v in body.vectors if v.is_correct]
     if not filter_vector:
@@ -47,10 +49,11 @@ async def update_user_baseline(
         np.float32
     )
     # Get user's baselines - list[np.ndarray]
-    baselines = get_user_baselines(body.username)
+    baselines = get_user_baselines(qdrant, body.username)
 
     if not baselines:
         upsert_vector(
+            qdrant,
             username=body.username,
             embedding=avg_vector.tolist(),
             is_correct=True,
@@ -76,7 +79,7 @@ async def update_user_baseline(
     if max_similarity > settings.UPPER_SIMILARITY_THRESHOLD:
         alpha = settings.EMA_ALPHA
         updated = (1 - alpha) * baselines[best_idx] + alpha * avg_vector
-        update_vector(body.username, best_idx, updated.tolist())
+        update_vector(qdrant, body.username, best_idx, updated.tolist())
         action = "ema_update"
 
     # Branch 2: New look, fill empty slot. This is likely a side profile or
@@ -84,6 +87,7 @@ async def update_user_baseline(
     elif max_similarity > settings.LOWER_SIMILARITY_THRESHOLD:
         if len(baselines) < settings.MAX_VECTORS_PER_USER:
             upsert_vector(
+                qdrant,
                 username=body.username,
                 embedding=avg_vector.tolist(),
                 is_correct=True,
@@ -195,6 +199,7 @@ async def get_device_threshold(device_id: str) -> ThresholdResponse:
 @router.get("/{device_id}", response_model=GetVectorsByDeviceIdResponse)
 async def get_vectors_by_device_id(
     device_id: str,
+    qdrant: QdrantDep,
 ) -> GetVectorsByDeviceIdResponse:
     """Return all vector records stored in Qdrant for every user
     associated with *device_id*.
@@ -225,7 +230,7 @@ async def get_vectors_by_device_id(
         )
 
     usernames = runs["params.username"].dropna().unique().tolist()
-    users_data = get_vectors_by_usernames(usernames)
+    users_data = get_vectors_by_usernames(qdrant, usernames)
     entries = [
         DeviceVectorEntry(
             username=username,

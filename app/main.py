@@ -7,6 +7,7 @@ from fastapi.routing import APIRoute
 from app.api.main import api_router
 from app.core.config import settings
 from app.core.logger import Logger
+from app.api.deps import client as qdrant_client
 from app.core.qdrant import init_collection
 
 logger = Logger().get_logger()
@@ -19,7 +20,7 @@ def custom_generate_unique_id(route: APIRoute) -> str:
 @asynccontextmanager
 async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     logger.info("Vector Operation ready — serving embedding gallery data")
-    init_collection()
+    init_collection(qdrant_client)
     yield
 
 
